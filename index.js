@@ -23,7 +23,7 @@ const BASE_HEADERS = {
 };
 
 // Wrapper around https.request that forces HTTP/1.1 and follows redirects
-function animeRequest(urlOrPath, extraHeaders = {}, redirectCount = 0) {
+function animeRequest(urlOrPath, extraHeaders = {}, redirectCount = 0, overrideHostname = null) {
     return new Promise((resolve, reject) => {
         if (redirectCount > 5) return reject(new Error("Too many redirects"));
 
@@ -34,7 +34,7 @@ function animeRequest(urlOrPath, extraHeaders = {}, redirectCount = 0) {
             hostname = u.hostname;
             path = u.pathname + u.search;
         } else {
-            hostname = "animeheaven.me";
+            hostname = overrideHostname || "animeheaven.me";
             path = urlOrPath;
         }
 
@@ -192,24 +192,55 @@ app.get("/watch", async (req, res) => {
         const stream = decompress(incoming);
         stream.on("data", c => html += c);
         stream.on("end", () => {
-            // Extract video source — m3u8, mp4, or iframe
-            const m3u8 = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)['"]/i)?.[1];
-            const mp4  = html.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)['"]/i)?.[1];
-            const file = html.match(/file\s*:\s*["'](https?:\/\/[^"']+)['"]/i)?.[1];
+            const m3u8   = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)['"]/i)?.[1];
+            const mp4    = html.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)['"]/i)?.[1];
+            const file   = html.match(/file\s*:\s*["'](https?:\/\/[^"']+)['"]/i)?.[1];
             const iframe = html.match(/<iframe[^>]+src=["'](https?:\/\/[^"']+)['"]/i)?.[1];
 
             const videoUrl = m3u8 || file || mp4 || null;
-
-            res.json({
-                videoUrl,
-                iframe: iframe || null,
-                // send raw HTML so client can parse further if needed
-                raw: html.length > 100 ? null : html,
-            });
+            res.json({ videoUrl, iframe: iframe || null });
         });
     } catch (err) {
         console.error("Watch error:", err.message);
         res.status(502).json({ error: "Failed to fetch watch page" });
+    }
+});
+
+// GET /stream?url=<encoded-video-url>  — proxies the video with range support
+app.get("/stream", async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: "Missing url" });
+
+    let parsed;
+    try {
+        parsed = new URL(url);
+    } catch {
+        return res.status(400).json({ error: "Invalid url" });
+    }
+
+    // Only allow animeheaven CDN domains
+    if (!parsed.hostname.endsWith("animeheaven.me")) {
+        return res.status(403).json({ error: "Forbidden domain" });
+    }
+
+    try {
+        const rangeHeader = req.headers["range"];
+        const extraHeaders = {
+            Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8",
+            Referer: "https://animeheaven.me/",
+        };
+        if (rangeHeader) extraHeaders["Range"] = rangeHeader;
+
+        const incoming = await animeRequest(parsed.pathname + parsed.search, extraHeaders, 0, parsed.hostname);
+
+        res.status(incoming.statusCode);
+        const forward = ["content-type", "content-length", "content-range", "accept-ranges", "cache-control"];
+        forward.forEach(h => { if (incoming.headers[h]) res.setHeader(h, incoming.headers[h]); });
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        incoming.pipe(res);
+    } catch (err) {
+        console.error("Stream error:", err.message);
+        res.status(502).json({ error: "Stream failed" });
     }
 });
 
