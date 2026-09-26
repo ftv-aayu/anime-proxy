@@ -78,6 +78,14 @@ function decompress(response) {
     return response;
 }
 
+// Like animeRequest but sends a cookie (for gate.php)
+function animeRequestWithCookie(path, cookieValue, extraHeaders = {}) {
+    return animeRequest(path, {
+        ...extraHeaders,
+        Cookie: `key=${cookieValue}`,
+    });
+}
+
 // GET /search?q=re+zero
 app.get("/search", async (req, res) => {
     const q = req.query.q;
@@ -162,6 +170,47 @@ app.head("/health", (_req, res) => res.sendStatus(200));
 
 app.listen(PORT, () => {
     console.log(`Anime proxy running on port ${PORT}`);
+});
+
+// GET /watch?id=<gateId>  — fetches gate.php with the key cookie and extracts the video source
+app.get("/watch", async (req, res) => {
+    const id = req.query.id;
+    if (!id || !/^[a-f0-9]+$/i.test(id)) return res.status(400).json({ error: "Invalid id" });
+
+    try {
+        const incoming = await animeRequestWithCookie("/gate.php", id, {
+            Accept: "text/html,application/xhtml+xml",
+            "Accept-Encoding": "gzip, deflate",
+            "Upgrade-Insecure-Requests": "1",
+        });
+
+        if (incoming.statusCode !== 200) {
+            return res.status(incoming.statusCode).json({ error: `Upstream ${incoming.statusCode}` });
+        }
+
+        let html = "";
+        const stream = decompress(incoming);
+        stream.on("data", c => html += c);
+        stream.on("end", () => {
+            // Extract video source — m3u8, mp4, or iframe
+            const m3u8 = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)['"]/i)?.[1];
+            const mp4  = html.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)['"]/i)?.[1];
+            const file = html.match(/file\s*:\s*["'](https?:\/\/[^"']+)['"]/i)?.[1];
+            const iframe = html.match(/<iframe[^>]+src=["'](https?:\/\/[^"']+)['"]/i)?.[1];
+
+            const videoUrl = m3u8 || file || mp4 || null;
+
+            res.json({
+                videoUrl,
+                iframe: iframe || null,
+                // send raw HTML so client can parse further if needed
+                raw: html.length > 100 ? null : html,
+            });
+        });
+    } catch (err) {
+        console.error("Watch error:", err.message);
+        res.status(502).json({ error: "Failed to fetch watch page" });
+    }
 });
 
 // Temp debug: GET /fetch?path=/watch.php?xxx  — fetch any animeheaven path (remove in prod)
