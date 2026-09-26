@@ -129,6 +129,8 @@ app.get("/image", async (req, res) => {
 });
 
 // Health check — supports both GET and HEAD (for UptimeRobot)
+app.get("/", (_req, res) => res.json({ status: "ok", service: "anime-proxy" }));
+app.head("/", (_req, res) => res.sendStatus(200));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 app.head("/health", (_req, res) => res.sendStatus(200));
 
