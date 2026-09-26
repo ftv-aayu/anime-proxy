@@ -102,6 +102,32 @@ app.get("/search", async (req, res) => {
     }
 });
 
+// GET /anime?id=0ggzd  — fetches the anime detail page HTML
+app.get("/anime", async (req, res) => {
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ error: "Missing query param: id" });
+    // Only allow alphanumeric IDs
+    if (!/^[a-z0-9]+$/i.test(id)) return res.status(400).json({ error: "Invalid id" });
+
+    try {
+        const incoming = await animeRequest(`/anime.php?${id}`, {
+            Accept: "text/html,application/xhtml+xml",
+            "Accept-Encoding": "gzip, deflate",
+            "Upgrade-Insecure-Requests": "1",
+        });
+
+        if (incoming.statusCode !== 200) {
+            return res.status(incoming.statusCode).json({ error: "Upstream error" });
+        }
+
+        res.setHeader("Content-Type", "text/html; charset=UTF-8");
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        console.error("Anime detail error:", err.message);
+        res.status(502).json({ error: "Failed to fetch anime detail" });
+    }
+});
+
 // GET /image?src=/image.php?7tc0j
 app.get("/image", async (req, res) => {
     const src = req.query.src;
