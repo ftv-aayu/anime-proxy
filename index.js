@@ -1,263 +1,317 @@
 const express = require("express");
-const https = require("https");
-const zlib = require("zlib");
+const https   = require("https");
+const zlib    = require("zlib");
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// Allow requests from any origin
+// ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
 });
 
-const BASE_HEADERS = {
-    "User-Agent":
-        "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Referer": "https://animeheaven.me/",
-    "Connection": "keep-alive",
-};
+app.use(express.text({ type: "text/plain" }));
 
-// Wrapper around https.request that forces HTTP/1.1 and follows redirects
-function animeRequest(urlOrPath, extraHeaders = {}, redirectCount = 0, overrideHostname = null) {
+// ── Generic HTTPS request helper ──────────────────────────────────────────────
+function makeRequest(hostname, path, method, extraHeaders, body, redirectCount = 0) {
     return new Promise((resolve, reject) => {
         if (redirectCount > 5) return reject(new Error("Too many redirects"));
+        const options = {
+            hostname, port: 443, path, method,
+            minVersion: "TLSv1.2", maxVersion: "TLSv1.3",
+            rejectUnauthorized: true,
+            headers: extraHeaders,
+        };
+        const req = https.request(options, (incoming) => {
+            const { statusCode, headers } = incoming;
+            if ([301, 302, 307, 308].includes(statusCode) && headers.location) {
+                incoming.resume();
+                const u = new URL(headers.location);
+                return makeRequest(u.hostname, u.pathname + u.search, "GET", extraHeaders, null, redirectCount + 1)
+                    .then(resolve).catch(reject);
+            }
+            resolve(incoming);
+        });
+        req.on("error", reject);
+        if (body) req.write(body);
+        req.end();
+    });
+}
 
-        // Accept full URL or just a path on animeheaven.me
-        let hostname, path;
+function decompress(response) {
+    const enc = response.headers["content-encoding"] || "";
+    if (enc.includes("gzip"))    return response.pipe(zlib.createGunzip());
+    if (enc.includes("deflate")) return response.pipe(zlib.createInflate());
+    if (enc.includes("br"))      return response.pipe(zlib.createBrotliDecompress());
+    return response;
+}
+
+function bodyToString(incoming) {
+    return new Promise((resolve, reject) => {
+        let data = "";
+        decompress(incoming).on("data", c => data += c).on("end", () => resolve(data)).on("error", reject);
+    });
+}
+
+// ── AnimeParadise: auto-fetch and cache the next-action hash ──────────────────
+let apActionCache = {
+    searchHash: null,
+    watchHash: null,
+    fetchedAt: 0,
+};
+
+async function getAPActions() {
+    // Cache for 30 minutes — the hash only changes on their deploy
+    if (apActionCache.searchHash && Date.now() - apActionCache.fetchedAt < 30 * 60 * 1000) {
+        return apActionCache;
+    }
+    try {
+        const html = await makeRequest("www.animeparadise.moe", "/search?page=1", "GET", {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+            "Accept": "text/html",
+            "Accept-Encoding": "gzip, deflate",
+        }, null).then(bodyToString);
+
+        // Find all next-action hashes from inline JS: they're long hex strings bound to server actions
+        const hashes = [...html.matchAll(/["']([a-f0-9]{40,})["']/gi)].map(m => m[1]);
+        const unique = [...new Set(hashes)];
+
+        // The search action is typically the first unique long hash
+        // The watch action is usually a different one — both are in the page
+        if (unique.length >= 1) {
+            apActionCache = {
+                searchHash: unique[0],
+                watchHash:  unique[1] || unique[0],
+                fetchedAt:  Date.now(),
+            };
+        }
+    } catch (e) {
+        console.warn("AP action fetch failed:", e.message);
+    }
+    return apActionCache;
+}
+
+// ── AnimeParadise search ─  POST /ap/search?q=bleach ─────────────────────────
+app.get("/ap/search", async (req, res) => {
+    const q = req.query.q;
+    if (!q) return res.status(400).json({ error: "Missing q" });
+
+    // Use hardcoded known-good hash as fallback; also try to auto-fetch
+    const { searchHash } = await getAPActions();
+    const actionHash = searchHash || "708838fdd26288675524861538242e1ccc0671b48c";
+
+    const body = JSON.stringify([q, { genres: [], year: null, season: null, page: 1, limit: 25, sort: null }, "$undefined"]);
+
+    try {
+        const incoming = await makeRequest("www.animeparadise.moe", "/search?page=1", "POST", {
+            "User-Agent":    "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+            "Accept":        "text/x-component",
+            "Accept-Encoding": "gzip, deflate",
+            "Content-Type":  "text/plain;charset=UTF-8",
+            "next-action":   actionHash,
+            "next-router-state-tree": encodeURIComponent(JSON.stringify(["",{"children":["search",{"children":["__PAGE__",{}]}]}])),
+        }, body);
+
+        const text = await bodyToString(incoming);
+        // Parse the NDJSON response: line starting with "1:" has the data
+        for (const line of text.split("\n")) {
+            if (line.startsWith("1:")) {
+                try {
+                    const parsed = JSON.parse(line.slice(2));
+                    return res.json(parsed);
+                } catch {}
+            }
+        }
+        res.status(502).json({ error: "Could not parse AP response" });
+    } catch (err) {
+        console.error("AP search error:", err.message);
+        res.status(502).json({ error: "AP search failed" });
+    }
+});
+
+// ── AnimeParadise stream ─ POST /ap/stream?uid=<uid>&origin=<_id> ─────────────
+app.get("/ap/stream", async (req, res) => {
+    const { uid, origin } = req.query;
+    if (!uid || !origin) return res.status(400).json({ error: "Missing uid or origin" });
+    if (!/^[a-z0-9-]+$/i.test(uid)) return res.status(400).json({ error: "Invalid uid" });
+
+    const { watchHash } = await getAPActions();
+    const actionHash = watchHash || "604982bef023a1ddf0c1c8fc7cdcf473df59ddeb64";
+    const body = JSON.stringify([uid, origin]);
+
+    try {
+        const incoming = await makeRequest(
+            "www.animeparadise.moe",
+            `/watch/${uid}?origin=${origin}`,
+            "POST",
+            {
+                "User-Agent":    "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+                "Accept":        "text/x-component",
+                "Accept-Encoding": "gzip, deflate",
+                "Content-Type":  "text/plain;charset=UTF-8",
+                "next-action":   actionHash,
+                "Referer":       `https://www.animeparadise.moe/watch/${uid}?origin=${origin}`,
+            },
+            body
+        );
+
+        const text = await bodyToString(incoming);
+        // Line "1:" contains episode data with streamLink
+        for (const line of text.split("\n")) {
+            if (line.startsWith("1:")) {
+                try {
+                    const data = JSON.parse(line.slice(2));
+                    const streamLink = data?.episode?.streamLink || null;
+                    const episodeList = data?.episodeList || [];
+                    return res.json({ streamLink, episodeList });
+                } catch {}
+            }
+        }
+        res.status(502).json({ error: "No stream data found" });
+    } catch (err) {
+        console.error("AP stream error:", err.message);
+        res.status(502).json({ error: "AP stream failed" });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AnimeHeaven endpoints (existing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AH_HEADERS = {
+    "User-Agent":     "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Referer":        "https://animeheaven.me/",
+    "Connection":     "keep-alive",
+};
+
+function ahRequest(urlOrPath, extraHeaders = {}, redirectCount = 0) {
+    return new Promise((resolve, reject) => {
+        if (redirectCount > 5) return reject(new Error("Too many redirects"));
+        let hostname = "animeheaven.me", path = urlOrPath;
         if (urlOrPath.startsWith("http")) {
             const u = new URL(urlOrPath);
             hostname = u.hostname;
             path = u.pathname + u.search;
-        } else {
-            hostname = overrideHostname || "animeheaven.me";
-            path = urlOrPath;
         }
-
         const options = {
-            hostname,
-            port: 443,
-            path,
-            method: "GET",
-            minVersion: "TLSv1.2",
-            maxVersion: "TLSv1.3",
+            hostname, port: 443, path, method: "GET",
+            minVersion: "TLSv1.2", maxVersion: "TLSv1.3",
             rejectUnauthorized: true,
-            headers: {
-                ...BASE_HEADERS,
-                ...extraHeaders,
-            },
+            headers: { ...AH_HEADERS, ...extraHeaders },
         };
-
         const req = https.request(options, (incoming) => {
             const { statusCode, headers } = incoming;
-            // Follow 301/302/307/308 redirects
             if ([301, 302, 307, 308].includes(statusCode) && headers.location) {
-                incoming.resume(); // drain the body
-                return animeRequest(headers.location, extraHeaders, redirectCount + 1)
-                    .then(resolve)
-                    .catch(reject);
+                incoming.resume();
+                return ahRequest(headers.location, extraHeaders, redirectCount + 1).then(resolve).catch(reject);
             }
             resolve(incoming);
         });
-
         req.on("error", reject);
         req.end();
     });
 }
 
-// Decompress gzip/deflate response if needed
-function decompress(response) {
-    const encoding = response.headers["content-encoding"] || "";
-    if (encoding.includes("gzip")) return response.pipe(zlib.createGunzip());
-    if (encoding.includes("deflate")) return response.pipe(zlib.createInflate());
-    if (encoding.includes("br")) return response.pipe(zlib.createBrotliDecompress());
-    return response;
-}
-
-// Like animeRequest but sends a cookie (for gate.php)
-function animeRequestWithCookie(path, cookieValue, extraHeaders = {}) {
-    return animeRequest(path, {
-        ...extraHeaders,
-        Cookie: `key=${cookieValue}`,
-    });
-}
-
-// GET /search?q=re+zero
+// GET /search?q=
 app.get("/search", async (req, res) => {
     const q = req.query.q;
-    if (!q) return res.status(400).json({ error: "Missing query param: q" });
-
+    if (!q) return res.status(400).json({ error: "Missing q" });
     try {
-        const path = `/fastsearch.php?xhr=1&s=${encodeURIComponent(q)}`;
-        const incoming = await animeRequest(path, {
-            Accept: "*/*",
-            "Accept-Encoding": "gzip, deflate",
+        const incoming = await ahRequest(`/fastsearch.php?xhr=1&s=${encodeURIComponent(q)}`, {
+            Accept: "*/*", "Accept-Encoding": "gzip, deflate",
         });
-
-        if (incoming.statusCode !== 200) {
-            return res.status(incoming.statusCode).json({ error: "Upstream error" });
-        }
-
+        if (incoming.statusCode !== 200) return res.status(incoming.statusCode).json({ error: "Upstream error" });
         res.setHeader("Content-Type", "text/html; charset=UTF-8");
         decompress(incoming).pipe(res);
     } catch (err) {
-        console.error("Search error:", err.message);
+        console.error("AH search error:", err.message);
         res.status(502).json({ error: "Failed to fetch from animeheaven" });
     }
 });
 
-// GET /anime?id=0ggzd  — fetches the anime detail page HTML
+// GET /anime?id=
 app.get("/anime", async (req, res) => {
     const id = req.query.id;
-    if (!id) return res.status(400).json({ error: "Missing query param: id" });
-    // Only allow alphanumeric IDs
-    if (!/^[a-z0-9]+$/i.test(id)) return res.status(400).json({ error: "Invalid id" });
-
+    if (!id || !/^[a-z0-9]+$/i.test(id)) return res.status(400).json({ error: "Invalid id" });
     try {
-        const incoming = await animeRequest(`/anime.php?${id}`, {
-            Accept: "text/html,application/xhtml+xml",
-            "Accept-Encoding": "gzip, deflate",
-            "Upgrade-Insecure-Requests": "1",
+        const incoming = await ahRequest(`/anime.php?${id}`, {
+            Accept: "text/html,application/xhtml+xml", "Accept-Encoding": "gzip, deflate",
         });
-
-        if (incoming.statusCode !== 200) {
-            return res.status(incoming.statusCode).json({ error: "Upstream error" });
-        }
-
+        if (incoming.statusCode !== 200) return res.status(incoming.statusCode).json({ error: "Upstream error" });
         res.setHeader("Content-Type", "text/html; charset=UTF-8");
         decompress(incoming).pipe(res);
     } catch (err) {
-        console.error("Anime detail error:", err.message);
         res.status(502).json({ error: "Failed to fetch anime detail" });
     }
 });
 
-// GET /image?src=/image.php?7tc0j
+// GET /image?src=
 app.get("/image", async (req, res) => {
     const src = req.query.src;
-    if (!src) return res.status(400).json({ error: "Missing query param: src" });
-    if (!src.startsWith("/")) return res.status(400).json({ error: "Invalid src" });
-
+    if (!src || !src.startsWith("/")) return res.status(400).json({ error: "Invalid src" });
     try {
-        const incoming = await animeRequest(src, {
-            Accept: "image/avif,image/webp,image/png,image/*;q=0.8,*/*;q=0.5",
-        });
-
-        if (incoming.statusCode !== 200) {
-            return res.status(incoming.statusCode).json({ error: "Upstream error" });
-        }
-
-        const contentType = incoming.headers["content-type"] || "image/jpeg";
-        res.setHeader("Content-Type", contentType);
+        const incoming = await ahRequest(src, { Accept: "image/avif,image/webp,image/png,image/*;q=0.8" });
+        if (incoming.statusCode !== 200) return res.status(incoming.statusCode).json({ error: "Upstream error" });
+        res.setHeader("Content-Type", incoming.headers["content-type"] || "image/jpeg");
         res.setHeader("Cache-Control", "public, max-age=86400");
-        // Images are not gzip-encoded by the server, pipe directly
         incoming.pipe(res);
     } catch (err) {
-        console.error("Image error:", err.message);
         res.status(502).json({ error: "Failed to fetch image" });
     }
 });
 
-// Health check — supports both GET and HEAD (for UptimeRobot)
-app.get("/", (_req, res) => res.json({ status: "ok", service: "anime-proxy" }));
-app.head("/", (_req, res) => res.sendStatus(200));
-app.get("/health", (_req, res) => res.json({ status: "ok" }));
-app.head("/health", (_req, res) => res.sendStatus(200));
-
-app.listen(PORT, () => {
-    console.log(`Anime proxy running on port ${PORT}`);
-});
-
-// GET /watch?id=<gateId>  — fetches gate.php with the key cookie and extracts the video source
+// GET /watch?id=   (AnimeHeaven gate.php)
 app.get("/watch", async (req, res) => {
     const id = req.query.id;
     if (!id || !/^[a-f0-9]+$/i.test(id)) return res.status(400).json({ error: "Invalid id" });
-
     try {
-        const incoming = await animeRequestWithCookie("/gate.php", id, {
-            Accept: "text/html,application/xhtml+xml",
-            "Accept-Encoding": "gzip, deflate",
-            "Upgrade-Insecure-Requests": "1",
+        const incoming = await ahRequest("/gate.php", {
+            Accept: "text/html,application/xhtml+xml", "Accept-Encoding": "gzip, deflate",
+            Cookie: `key=${id}`, "Upgrade-Insecure-Requests": "1",
         });
-
-        if (incoming.statusCode !== 200) {
-            return res.status(incoming.statusCode).json({ error: `Upstream ${incoming.statusCode}` });
-        }
-
-        let html = "";
-        const stream = decompress(incoming);
-        stream.on("data", c => html += c);
-        stream.on("end", () => {
-            const m3u8   = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)['"]/i)?.[1];
-            const mp4    = html.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)['"]/i)?.[1];
-            const file   = html.match(/file\s*:\s*["'](https?:\/\/[^"']+)['"]/i)?.[1];
-            const iframe = html.match(/<iframe[^>]+src=["'](https?:\/\/[^"']+)['"]/i)?.[1];
-
-            const videoUrl = m3u8 || file || mp4 || null;
-            res.json({ videoUrl, iframe: iframe || null });
-        });
+        if (incoming.statusCode !== 200) return res.status(incoming.statusCode).json({ error: `Upstream ${incoming.statusCode}` });
+        const html = await bodyToString(incoming);
+        const m3u8   = html.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)['"]/i)?.[1];
+        const mp4    = html.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)['"]/i)?.[1];
+        const file   = html.match(/file\s*:\s*["'](https?:\/\/[^"']+)['"]/i)?.[1];
+        const iframe = html.match(/<iframe[^>]+src=["'](https?:\/\/[^"']+)['"]/i)?.[1];
+        res.json({ videoUrl: m3u8 || file || mp4 || null, iframe: iframe || null });
     } catch (err) {
-        console.error("Watch error:", err.message);
         res.status(502).json({ error: "Failed to fetch watch page" });
     }
 });
 
-// GET /stream?url=<encoded-video-url>  — proxies the video with range support
+// GET /stream?url=  (AnimeHeaven video proxy with range support)
 app.get("/stream", async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: "Missing url" });
-
     let parsed;
+    try { parsed = new URL(url); } catch { return res.status(400).json({ error: "Invalid url" }); }
+    if (!parsed.hostname.endsWith("animeheaven.me")) return res.status(403).json({ error: "Forbidden domain" });
     try {
-        parsed = new URL(url);
-    } catch {
-        return res.status(400).json({ error: "Invalid url" });
-    }
-
-    // Only allow animeheaven CDN domains
-    if (!parsed.hostname.endsWith("animeheaven.me")) {
-        return res.status(403).json({ error: "Forbidden domain" });
-    }
-
-    try {
-        const rangeHeader = req.headers["range"];
-        const extraHeaders = {
-            Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8",
-            Referer: "https://animeheaven.me/",
-        };
-        if (rangeHeader) extraHeaders["Range"] = rangeHeader;
-
-        const incoming = await animeRequest(parsed.pathname + parsed.search, extraHeaders, 0, parsed.hostname);
-
+        const extraHeaders = { Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8", Referer: "https://animeheaven.me/" };
+        if (req.headers["range"]) extraHeaders["Range"] = req.headers["range"];
+        const incoming = await makeRequest(parsed.hostname, parsed.pathname + parsed.search, "GET", { ...AH_HEADERS, ...extraHeaders }, null);
         res.status(incoming.statusCode);
-        const forward = ["content-type", "content-length", "content-range", "accept-ranges", "cache-control"];
-        forward.forEach(h => { if (incoming.headers[h]) res.setHeader(h, incoming.headers[h]); });
+        ["content-type","content-length","content-range","accept-ranges","cache-control"].forEach(h => {
+            if (incoming.headers[h]) res.setHeader(h, incoming.headers[h]);
+        });
         res.setHeader("Access-Control-Allow-Origin", "*");
         incoming.pipe(res);
     } catch (err) {
-        console.error("Stream error:", err.message);
         res.status(502).json({ error: "Stream failed" });
     }
 });
 
-// Temp debug: GET /fetch?path=/watch.php?xxx  — fetch any animeheaven path (remove in prod)
-app.get("/fetch", async (req, res) => {
-    const p = req.query.path;
-    if (!p || !p.startsWith("/")) return res.status(400).json({ error: "bad path" });
-    try {
-        const incoming = await animeRequest(p, {
-            Accept: "text/html,application/xhtml+xml",
-            "Accept-Encoding": "gzip, deflate",
-            "Upgrade-Insecure-Requests": "1",
-        });
-        res.setHeader("Content-Type", "text/html; charset=UTF-8");
-        res.setHeader("X-Status", incoming.statusCode);
-        decompress(incoming).pipe(res);
-    } catch (err) {
-        res.status(502).json({ error: err.message });
-    }
-});
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get("/",       (_req, res) => res.json({ status: "ok", service: "anime-proxy" }));
+app.head("/",      (_req, res) => res.sendStatus(200));
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.head("/health",(_req, res) => res.sendStatus(200));
+
+app.listen(PORT, () => console.log(`Anime proxy running on port ${PORT}`));
