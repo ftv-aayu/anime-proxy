@@ -163,3 +163,21 @@ app.head("/health", (_req, res) => res.sendStatus(200));
 app.listen(PORT, () => {
     console.log(`Anime proxy running on port ${PORT}`);
 });
+
+// Temp debug: GET /fetch?path=/watch.php?xxx  — fetch any animeheaven path (remove in prod)
+app.get("/fetch", async (req, res) => {
+    const p = req.query.path;
+    if (!p || !p.startsWith("/")) return res.status(400).json({ error: "bad path" });
+    try {
+        const incoming = await animeRequest(p, {
+            Accept: "text/html,application/xhtml+xml",
+            "Accept-Encoding": "gzip, deflate",
+            "Upgrade-Insecure-Requests": "1",
+        });
+        res.setHeader("Content-Type", "text/html; charset=UTF-8");
+        res.setHeader("X-Status", incoming.statusCode);
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        res.status(502).json({ error: err.message });
+    }
+});
