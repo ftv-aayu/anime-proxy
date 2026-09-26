@@ -1,0 +1,17 @@
+{
+  "name": "anime-proxy",
+  "version": "1.0.0",
+  "description": "Proxy server for animeheaven.me to bypass CORS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "4.19.2",
+    "node-fetch": "2.7.0"
+  }
+}
