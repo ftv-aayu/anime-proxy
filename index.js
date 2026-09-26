@@ -22,18 +22,29 @@ const BASE_HEADERS = {
     "Connection": "keep-alive",
 };
 
-// Wrapper around https.request that forces HTTP/1.1 via maxVersion trick
-function animeRequest(path, extraHeaders = {}) {
+// Wrapper around https.request that forces HTTP/1.1 and follows redirects
+function animeRequest(urlOrPath, extraHeaders = {}, redirectCount = 0) {
     return new Promise((resolve, reject) => {
+        if (redirectCount > 5) return reject(new Error("Too many redirects"));
+
+        // Accept full URL or just a path on animeheaven.me
+        let hostname, path;
+        if (urlOrPath.startsWith("http")) {
+            const u = new URL(urlOrPath);
+            hostname = u.hostname;
+            path = u.pathname + u.search;
+        } else {
+            hostname = "animeheaven.me";
+            path = urlOrPath;
+        }
+
         const options = {
-            hostname: "animeheaven.me",
+            hostname,
             port: 443,
             path,
             method: "GET",
-            // Forcing TLS options that result in HTTP/1.1 negotiation
             minVersion: "TLSv1.2",
             maxVersion: "TLSv1.3",
-            // Disable session reuse which can trigger h2
             rejectUnauthorized: true,
             headers: {
                 ...BASE_HEADERS,
@@ -42,6 +53,14 @@ function animeRequest(path, extraHeaders = {}) {
         };
 
         const req = https.request(options, (incoming) => {
+            const { statusCode, headers } = incoming;
+            // Follow 301/302/307/308 redirects
+            if ([301, 302, 307, 308].includes(statusCode) && headers.location) {
+                incoming.resume(); // drain the body
+                return animeRequest(headers.location, extraHeaders, redirectCount + 1)
+                    .then(resolve)
+                    .catch(reject);
+            }
             resolve(incoming);
         });
 
@@ -109,8 +128,9 @@ app.get("/image", async (req, res) => {
     }
 });
 
-// Health check
+// Health check — supports both GET and HEAD (for UptimeRobot)
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.head("/health", (_req, res) => res.sendStatus(200));
 
 app.listen(PORT, () => {
     console.log(`Anime proxy running on port ${PORT}`);
