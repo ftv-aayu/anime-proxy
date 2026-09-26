@@ -167,7 +167,13 @@ app.get("/ap/stream", async (req, res) => {
                     const data = JSON.parse(line.slice(2));
                     const streamLink = data?.episode?.streamLink || null;
                     const episodeList = data?.episodeList || [];
-                    return res.json({ streamLink, episodeList });
+                    // Extract subData from current episode — prefer vtt, fallback to ass
+                    const subData = (data?.episode?.subData || []).map(s => ({
+                        src:   s.src,
+                        label: s.label,
+                        type:  s.type,
+                    }));
+                    return res.json({ streamLink, episodeList, subData });
                 } catch {}
             }
         }
