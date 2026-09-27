@@ -184,6 +184,12 @@ app.get("/ap/stream", async (req, res) => {
     }
 });
 
+// GET /ap/action-hash  — return current next-action hash so browser can POST directly
+app.get("/ap/action-hash", async (req, res) => {
+    const { watchHash } = await getAPActions();
+    res.json({ watchHash: watchHash || "604982bef023a1ddf0c1c8fc7cdcf473df59ddeb64" });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AnimeHeaven endpoints (existing)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -311,6 +317,83 @@ app.get("/stream", async (req, res) => {
         incoming.pipe(res);
     } catch (err) {
         res.status(502).json({ error: "Stream failed" });
+    }
+});
+
+// ── AnimParadise CDN proxy ────────────────────────────────────────────────────
+// Both stream.animeparadise.moe/m3u8 and /captions block non-AP origins.
+// ── AnimParadise CDN proxy ────────────────────────────────────────────────────
+// stream.animeparadise.moe blocks non-AP origins — proxy with correct Referer
+
+const AP_CDN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "Referer":    "https://www.animeparadise.moe/",
+    "Origin":     "https://www.animeparadise.moe",
+};
+
+// GET /ap/m3u8?streamLink=<link>  — proxy HLS manifest with fresh fetch, rewrite segment URLs
+// Also accepts: /ap/m3u8?url=<already-encoded-segment-url> for segment proxying
+app.get("/ap/m3u8", async (req, res) => {
+    const streamLink = req.query.streamLink;
+    const segUrl     = req.query.url;
+
+    if (!streamLink && !segUrl) return res.status(400).json({ error: "Missing streamLink or url" });
+
+    // Build the path: if streamLink, call /m3u8?url=<streamLink>
+    //                 if url (segment), call /m3u8?url=<url>
+    const encodedParam = streamLink
+        ? encodeURIComponent(streamLink)
+        : encodeURIComponent(segUrl);
+
+    try {
+        const incoming = await makeRequest(
+            "stream.animeparadise.moe",
+            `/m3u8?url=${encodedParam}`,
+            "GET", AP_CDN_HEADERS, null
+        );
+        res.status(incoming.statusCode);
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Content-Type", incoming.headers["content-type"] || "application/x-mpegURL");
+
+        if (incoming.statusCode === 200) {
+            let body = "";
+            const s = decompress(incoming);
+            s.on("data", c => body += c);
+            s.on("end", () => {
+                // Rewrite relative /m3u8?url=<segUrl> → /ap/m3u8?url=<segUrl>
+                // so HLS.js fetches segments through our proxy too
+                body = body.replace(/^\/m3u8\?url=([^\s\r\n]+)/gm,
+                    (_, u) => `/ap/m3u8?url=${u}`);
+                res.send(body);
+            });
+            s.on("error", () => res.status(502).end());
+        } else {
+            incoming.pipe(res);
+        }
+    } catch (err) {
+        console.error("AP m3u8 error:", err.message);
+        res.status(502).json({ error: "AP m3u8 failed" });
+    }
+});
+
+// GET /ap/captions?url=<encoded>  — proxy VTT subtitle files
+app.get("/ap/captions", async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).json({ error: "Missing url" });
+
+    try {
+        const incoming = await makeRequest(
+            "stream.animeparadise.moe",
+            `/captions?url=${encodeURIComponent(url)}`,
+            "GET", AP_CDN_HEADERS, null
+        );
+        res.status(incoming.statusCode);
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Content-Type", incoming.headers["content-type"] || "text/vtt");
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        console.error("AP captions error:", err.message);
+        res.status(502).json({ error: "AP captions failed" });
     }
 });
 
