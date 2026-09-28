@@ -191,6 +191,111 @@ app.get("/ap/action-hash", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Anikoto endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AK_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept":          "application/json, text/javascript, */*; q=0.01",
+    "Referer":         "https://anikototv.to/",
+};
+
+// GET /ak/search?q=bleach
+app.get("/ak/search", async (req, res) => {
+    const q = req.query.q;
+    if (!q) return res.status(400).json({ error: "Missing q" });
+    try {
+        const incoming = await makeRequest(
+            "anikototv.to",
+            `/ajax/anime/search?keyword=${encodeURIComponent(q)}`,
+            "GET", AK_HEADERS, null
+        );
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        res.status(502).json({ error: "AK search failed" });
+    }
+});
+
+// GET /ak/episodes?id=6825  — episode list for an anime
+app.get("/ak/episodes", async (req, res) => {
+    const id = req.query.id;
+    if (!id || !/^\d+$/.test(id)) return res.status(400).json({ error: "Invalid id" });
+    try {
+        const incoming = await makeRequest(
+            "anikototv.to",
+            `/ajax/episode/list/${id}`,
+            "GET", AK_HEADERS, null
+        );
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        res.status(502).json({ error: "AK episodes failed" });
+    }
+});
+
+// GET /ak/servers?ids=<base64>  — server list for an episode
+app.get("/ak/servers", async (req, res) => {
+    const ids = req.query.ids;
+    if (!ids) return res.status(400).json({ error: "Missing ids" });
+    try {
+        const incoming = await makeRequest(
+            "anikototv.to",
+            `/ajax/server/list?servers=${encodeURIComponent(ids)}`,
+            "GET", AK_HEADERS, null
+        );
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        res.status(502).json({ error: "AK servers failed" });
+    }
+});
+
+// GET /ak/source?linkId=<base64>  — get embed URL for a server
+app.get("/ak/source", async (req, res) => {
+    const linkId = req.query.linkId;
+    if (!linkId) return res.status(400).json({ error: "Missing linkId" });
+    try {
+        const incoming = await makeRequest(
+            "anikototv.to",
+            `/ajax/server?get=${encodeURIComponent(linkId)}`,
+            "GET", { ...AK_HEADERS, "Referer": "https://anikototv.to/watch/" },
+            null
+        );
+        const body = await bodyToString(incoming);
+        // Returns {status:200, result:{url:"https://megaplay.buzz/stream/...", skip_data:{...}}}
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.send(body);
+    } catch (err) {
+        res.status(502).json({ error: "AK source failed" });
+    }
+});
+
+// GET /ak/page?slug=bleach-sennen-...  — anime watch page HTML (for data-id + meta)
+app.get("/ak/page", async (req, res) => {
+    const slug = req.query.slug;
+    if (!slug || !/^[\w-]+$/.test(slug)) return res.status(400).json({ error: "Invalid slug" });
+    try {
+        const incoming = await makeRequest("anikototv.to", `/watch/${slug}`, "GET", {
+            "User-Agent":      AK_HEADERS["User-Agent"],
+            "Accept":          "text/html",
+            "Accept-Encoding": "gzip, deflate",
+            "Referer":         "https://anikototv.to/",
+        }, null);
+        res.setHeader("Content-Type", "text/html; charset=UTF-8");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        decompress(incoming).pipe(res);
+    } catch (err) {
+        res.status(502).json({ error: "AK page failed" });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AnimeHeaven endpoints (existing)
 // ─────────────────────────────────────────────────────────────────────────────
 
